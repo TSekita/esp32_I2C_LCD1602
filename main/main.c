@@ -10,7 +10,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "freertos/event_groups.h"
-#include "myheader.h"
+#include "myheader.h"               // #define WIFI_SSID , #define WIFI_PASS
 #include "dht.h" 
 
 #define DHT_GPIO GPIO_NUM_4
