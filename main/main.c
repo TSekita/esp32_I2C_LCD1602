@@ -14,6 +14,8 @@
 #include "dht.h" 
 
 #define DHT_GPIO GPIO_NUM_4
+#define SNOOZE_SWITCH_GPIO GPIO_NUM_5  // スヌーズスイッチ用のGPIOピン
+#define SET_BUTTON_GPIO GPIO_NUM_18    // 設定ボタン用のGPIOピン
 
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -36,6 +38,20 @@ static EventGroupHandle_t wifi_event_group;
 #define RW              0x02
 #define RS              0x01
 
+static bool snooze_enabled = false;  // スヌーズ機能の状態
+
+// 時計のアイコン用のカスタムキャラクター
+uint8_t clock_char[8] = {
+    0b00000,
+    0b01110,
+    0b10101,
+    0b10111,
+    0b10001,
+    0b01110,
+    0b00000,
+    0b00000
+};
+
 uint8_t degree_char[8] = {
     0b01000,
     0b10100,
@@ -57,6 +73,16 @@ uint8_t humidity_char[8] = {
     0b01110,
     0b00000
 };
+
+// スヌーズ設定用の変数
+static bool setting_mode = false;      // 設定モード中かどうか
+static bool blink_state = false;       // 点滅状態
+static uint8_t setting_target = 0;     // 設定対象（0:時、1:分、2:秒）
+static uint8_t snooze_hours = 0;       // スヌーズ時間（時）
+static uint8_t snooze_minutes = 0;     // スヌーズ時間（分）
+static uint8_t snooze_seconds = 0;     // スヌーズ時間（秒）
+static uint32_t last_button_press = 0; // 最後のボタン押下時刻
+static bool button_pressed = false;    // ボタン押下状態
 
 void i2c_master_init(void)
 {
@@ -138,6 +164,37 @@ void lcd_init(void)
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
+void init_snooze_switch(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << SNOOZE_SWITCH_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+}
+
+void check_snooze_switch(void)
+{
+    static bool last_state = false;
+    bool current_state = gpio_get_level(SNOOZE_SWITCH_GPIO) == 0;  // プルアップなので、0がON
+
+    if (current_state != last_state) {
+        snooze_enabled = current_state;
+        last_state = current_state;
+        
+        // LCDの表示を更新
+        lcd_send_cmd(0xC0 + 9);  // 1行目の先頭に移動
+        if (snooze_enabled) {
+            lcd_send_data(0x02);  // 時計アイコンを表示
+        } else {
+            lcd_send_data(' ');   // スペースで消去
+        }
+    }
+}
+
 void initialize_time()
 {
     // Get the current time from an NTP server (Wi-Fi connection required)
@@ -145,6 +202,11 @@ void initialize_time()
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_init();
 
+    setenv("TZ", "JST-9", 1);
+    tzset();
+
+    init_snooze_switch();
+    check_snooze_switch();
     // Wait until the time is successfully obtained
     time_t now = 0;
     struct tm timeinfo = {0};
@@ -169,6 +231,80 @@ void lcd_create_custom_char(uint8_t location, uint8_t charmap[])
     }
 }
 
+// ボタン初期化関数
+void init_set_button(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << SET_BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+}
+
+// ボタン処理関数
+void handle_set_button(void)
+{
+    bool current_state = gpio_get_level(SET_BUTTON_GPIO) == 0;  // プルアップなので、0が押下
+    uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    if (current_state && !button_pressed) {
+        // ボタンが押された
+        button_pressed = true;
+        last_button_press = current_time;
+    } else if (!current_state && button_pressed) {
+        // ボタンが離された
+        button_pressed = false;
+        uint32_t press_duration = current_time - last_button_press;
+
+        if (press_duration < 3000) {  // 3秒未満の押下
+            if (!setting_mode) {
+                // 設定モード開始
+                setting_mode = true;
+                setting_target = 0;
+                // snooze_hours = 0;
+                // snooze_minutes = 0;
+                // snooze_seconds = 0;
+            } else {
+                // 現在の設定対象の値を増加
+                switch (setting_target) {
+                    case 0: snooze_hours = (snooze_hours + 1) % 24; break;
+                    case 1: snooze_minutes = (snooze_minutes + 1) % 60; break;
+                    case 2: snooze_seconds = (snooze_seconds + 1) % 60; break;
+                }
+            }
+        } else {  // 3秒以上の長押し
+            if (setting_mode) {
+                setting_target++;
+                if (setting_target > 2) {
+                    // 設定完了
+                    setting_mode = false;
+                    setting_target = 0;
+                }
+            }
+        }
+    }
+}
+
+// スヌーズ時間チェック関数
+void check_snooze_time(void)
+{
+    if (!snooze_enabled || !setting_mode) return;
+
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    if (timeinfo.tm_hour == snooze_hours &&
+        timeinfo.tm_min == snooze_minutes &&
+        timeinfo.tm_sec == snooze_seconds) {
+        ESP_LOGI("SNOOZE", "It's time!");
+    }
+}
+
 void display_time_on_lcd()
 {
     time_t now;
@@ -177,8 +313,14 @@ void display_time_on_lcd()
     char line2[17];
     int16_t temperature = 0, humidity = 0;
     const char *weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static uint32_t last_blink = 0;
+    static bool time_reached = false;  // 時間到達フラグ
 
     while (1) {
+        check_snooze_switch();
+        handle_set_button();
+        check_snooze_time();
+
         time(&now);
         localtime_r(&now, &timeinfo);
 
@@ -186,16 +328,57 @@ void display_time_on_lcd()
         esp_err_t res = dht_read_data(DHT_TYPE_DHT11, DHT_GPIO, &humidity, &temperature);
         float temp = (res == ESP_OK) ? (float)temperature / 10.0 : -100.0;
         float hum = (res == ESP_OK) ? (float)humidity / 10.0 : -1.0;
-        ESP_LOGI("DHT", "Temperature: %.1f°C, Humidity: %.1f%%", temp, hum);
-        // Line 1: Date and weekda
+
+        // デバッグ用のログ出力
+        if (snooze_enabled && setting_mode) {
+            ESP_LOGI("DEBUG", "Current: %02d:%02d:%02d, Snooze: %02d:%02d:%02d, Enabled: %d, Setting: %d",
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                     snooze_hours, snooze_minutes, snooze_seconds,
+                     snooze_enabled, setting_mode);
+        }
+
+        // Line 1: Date and weekday
         snprintf(line1, sizeof(line1), "%04d%02d%02d %s %2.0f",
                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                  weekdays[timeinfo.tm_wday], temp);
 
         // Line 2: Time and humidity
-        snprintf(line2, sizeof(line2), "%02d:%02d:%02d     %2.0f%%",
-                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
-                 hum);
+        if (setting_mode) {
+            // 設定モード中の表示
+            uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (current_time - last_blink >= 200) {  // 200msごとに点滅
+                blink_state = !blink_state;
+                last_blink = current_time;
+            }
+
+            if (blink_state || setting_target != 0) {
+                snprintf(line2, sizeof(line2), "%02d:", snooze_hours);
+            } else {
+                snprintf(line2, sizeof(line2), "  :");
+            }
+            if (blink_state || setting_target != 1) {
+                char temp[5];
+                snprintf(temp, sizeof(temp), "%02d:", snooze_minutes);
+                strcat(line2, temp);
+            } else {
+                strcat(line2, "  :");
+            }
+            if (blink_state || setting_target != 2) {
+                char temp[5];
+                snprintf(temp, sizeof(temp), "%02d", snooze_seconds);
+                strcat(line2, temp);
+            } else {
+                strcat(line2, "  ");
+            }
+            char temp[10];
+            snprintf(temp, sizeof(temp), "     %2.0f%%", hum);
+            strcat(line2, temp);
+        } else {
+            // 通常表示
+            snprintf(line2, sizeof(line2), "%02d:%02d:%02d     %2.0f%%",
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec,
+                     hum);
+        }
 
         lcd_send_cmd(0x80);                 // Set cursor to the beginning of line 1
         lcd_send_string(line1);
@@ -205,7 +388,26 @@ void display_time_on_lcd()
         lcd_send_cmd(0xC0 + 12);            // Move cursor to position 12 of line 2
         lcd_send_data(0x01);                // Display character from slot 1 (humidity symbol)
 
-        vTaskDelay(pdMS_TO_TICKS(1000));    // Update every 1 second
+        if(snooze_enabled){
+            lcd_send_cmd(0xC0 + 9);
+            lcd_send_data(0x02);
+        }
+
+        // スヌーズ時間のチェック（設定モード中は除外）
+        if (snooze_enabled && !setting_mode) {
+            if (timeinfo.tm_hour == snooze_hours &&
+                timeinfo.tm_min == snooze_minutes &&
+                timeinfo.tm_sec == snooze_seconds) {
+                if (!time_reached) {  // 初回のみメッセージを表示
+                    ESP_LOGI("SNOOZE", "It's time!");
+                    time_reached = true;
+                }
+            } else {
+                time_reached = false;  // 時間が異なる場合はフラグをリセット
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));    // Update every 200ms
     }
 }
 
@@ -272,9 +474,15 @@ void app_main(void)
 
     lcd_create_custom_char(0, degree_char);  // Register degree symbol to slot 0
     lcd_create_custom_char(1, humidity_char);  // Register humidity symbol to slot 1
+    lcd_create_custom_char(2, clock_char);  // 時計アイコンをスロット2に登録
 
     initialize_time();         // Get the current time from the network
     setenv("TZ", "JST-9", 1);
     tzset();
+    
+    init_snooze_switch();
+    init_set_button();
+    check_snooze_switch();
+    
     display_time_on_lcd();     // Display on the LCD
 }
